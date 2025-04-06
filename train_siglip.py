@@ -23,8 +23,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 # Hugging Face imports
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
-# Progress tracking
+# Progress tracking and visualization
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from collections import defaultdict
 
 # Set up logging
 logging.basicConfig(
@@ -77,7 +79,7 @@ class CIFAR10SigLIPDataset(Dataset):
             logger.info(f"Successfully loaded {len(self.data)} samples from CSV")
             
             # Verify required columns exist
-            required_columns = ['Dataset_Index', 'Concat_Q', 'Concat_A']
+            required_columns = ['Dataset_Index'] + [f'Q{i}' for i in range(1, 6)] + [f'A{i}' for i in range(1, 6)]
             missing_columns = [col for col in required_columns if col not in self.data.columns]
             if missing_columns:
                 raise ValueError(f"Missing required columns in CSV: {', '.join(missing_columns)}")
@@ -113,32 +115,40 @@ class CIFAR10SigLIPDataset(Dataset):
             raise
 
     def __len__(self):
-        return len(self.data)
+        return len(self.data) * 5  # 5 Q&A pairs per image
 
     def __getitem__(self, idx):
         try:
+            # Calculate image index and Q&A pair index
+            image_idx = idx // 5  # Integer division to get the image index
+            qa_idx = idx % 5 + 1  # Get Q&A pair number (1-5)
+            
             # Get image from CIFAR10 dataset using Dataset_Index
-            dataset_idx = int(self.data.iloc[idx]['Dataset_Index'])
+            dataset_idx = int(self.data.iloc[image_idx]['Dataset_Index'])
             image, _ = self.cifar10[dataset_idx]
             
-            # Get concatenated text (questions and answers)
-            questions = self.data.iloc[idx]['Concat_Q']
-            answers = self.data.iloc[idx]['Concat_A']
+            # Get question and answer pair
+            question = self.data.iloc[image_idx][f'Q{qa_idx}']
+            answer = self.data.iloc[image_idx][f'A{qa_idx}']
             
-            # Combine all text for context
-            text = f"Questions: {questions} Answers: {answers}"
+            # Clean and combine text
+            question = str(question).strip()
+            answer = str(answer).strip()
+            text = f"Question: {question} Answer: {answer}"
             
             if self.transform:
                 try:
                     image = self.transform(image)
                 except Exception as e:
-                    logger.error(f"Error applying transform to image {idx}: {str(e)}")
+                    logger.error(f"Error applying transform to image {image_idx}: {str(e)}")
                     raise
             
             return {
                 'image': image,
                 'text': text,
-                'index': idx
+                'index': idx,
+                'image_idx': image_idx,
+                'qa_idx': qa_idx
             }
         except Exception as e:
             logger.error(f"Error loading item {idx}: {str(e)}")
@@ -154,7 +164,7 @@ class SigLIPModel(nn.Module):
             logger.info(f"Initializing model with dtype: {self.dtype}")
             
             # Image encoder (ResNet50 backbone)
-            self.image_encoder = models.resnet50(pretrained=True)
+            self.image_encoder = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
             self.image_encoder.fc = nn.Linear(2048, config.embedding_dim)
             
             # Load Phi model for text encoding (frozen)
@@ -223,23 +233,177 @@ class SigLIPModel(nn.Module):
             logger.error(f"Error in forward pass: {str(e)}")
             raise
 
+class TrainingMetrics:
+    """Class to track and visualize training metrics"""
+    def __init__(self):
+        self.metrics = defaultdict(list)
+        self.epoch_metrics = defaultdict(list)
+    
+    def update(self, metrics_dict):
+        """Update batch-level metrics"""
+        for key, value in metrics_dict.items():
+            self.metrics[key].append(value)
+    
+    def update_epoch(self, metrics_dict):
+        """Update epoch-level metrics"""
+        for key, value in metrics_dict.items():
+            self.epoch_metrics[key].append(value)
+    
+    def plot_metrics(self, save_dir):
+        """Plot and save training metrics"""
+        try:
+            # Create metrics directory
+            metrics_dir = os.path.join(save_dir, 'metrics')
+            os.makedirs(metrics_dir, exist_ok=True)
+            
+            # Plot epoch metrics
+            plt.figure(figsize=(15, 5))
+            
+            # Loss plot
+            plt.subplot(1, 2, 1)
+            plt.plot(self.epoch_metrics['avg_loss'], label='Average Loss')
+            plt.title('Training Loss per Epoch')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.grid(True)
+            plt.legend()
+            
+            # Learning rate plot
+            plt.subplot(1, 2, 2)
+            plt.plot(self.epoch_metrics['learning_rate'], label='Learning Rate')
+            plt.title('Learning Rate Schedule')
+            plt.xlabel('Epoch')
+            plt.ylabel('Learning Rate')
+            plt.grid(True)
+            plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(metrics_dir, 'epoch_metrics.png'))
+            plt.close()
+            
+            # Plot batch metrics
+            plt.figure(figsize=(15, 10))
+            
+            # Batch loss
+            plt.subplot(2, 2, 1)
+            plt.plot(self.metrics['batch_loss'], label='Batch Loss', alpha=0.5)
+            plt.title('Training Loss per Batch')
+            plt.xlabel('Batch')
+            plt.ylabel('Loss')
+            plt.grid(True)
+            plt.legend()
+            
+            # Gradient norm
+            if 'grad_norm' in self.metrics:
+                plt.subplot(2, 2, 2)
+                plt.plot(self.metrics['grad_norm'], label='Gradient Norm', alpha=0.5)
+                plt.title('Gradient Norm per Batch')
+                plt.xlabel('Batch')
+                plt.ylabel('Norm')
+                plt.grid(True)
+                plt.legend()
+            
+            # Valid batches per epoch
+            plt.subplot(2, 2, 3)
+            plt.bar(range(len(self.epoch_metrics['valid_batches'])), 
+                   self.epoch_metrics['valid_batches'],
+                   label='Valid Batches')
+            plt.title('Valid Batches per Epoch')
+            plt.xlabel('Epoch')
+            plt.ylabel('Count')
+            plt.legend()
+            
+            # AMP scaling factor
+            if 'amp_scale' in self.metrics:
+                plt.subplot(2, 2, 4)
+                plt.plot(self.metrics['amp_scale'], label='AMP Scale', alpha=0.5)
+                plt.title('AMP Scaling Factor')
+                plt.xlabel('Batch')
+                plt.ylabel('Scale')
+                plt.grid(True)
+                plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(metrics_dir, 'batch_metrics.png'))
+            plt.close()
+            
+            # Save metrics to CSV
+            metrics_df = pd.DataFrame({
+                'epoch': range(1, len(self.epoch_metrics['avg_loss']) + 1),
+                'avg_loss': self.epoch_metrics['avg_loss'],
+                'learning_rate': self.epoch_metrics['learning_rate'],
+                'valid_batches': self.epoch_metrics['valid_batches']
+            })
+            metrics_df.to_csv(os.path.join(metrics_dir, 'training_metrics.csv'), index=False)
+            
+            # Save summary statistics
+            summary = {
+                'final_loss': self.epoch_metrics['avg_loss'][-1],
+                'best_loss': min(self.epoch_metrics['avg_loss']),
+                'total_epochs': len(self.epoch_metrics['avg_loss']),
+                'total_batches': len(self.metrics['batch_loss']),
+                'total_valid_batches': sum(self.epoch_metrics['valid_batches']),
+                'avg_valid_batches_per_epoch': np.mean(self.epoch_metrics['valid_batches']),
+                'final_learning_rate': self.epoch_metrics['learning_rate'][-1]
+            }
+            
+            with open(os.path.join(metrics_dir, 'training_summary.json'), 'w') as f:
+                json.dump(summary, f, indent=4)
+            
+            logger.info("Training metrics saved to directory: %s", metrics_dir)
+            logger.info("\nTraining Summary:")
+            logger.info("-----------------")
+            logger.info(f"Total Epochs: {summary['total_epochs']}")
+            logger.info(f"Total Batches: {summary['total_batches']}")
+            logger.info(f"Final Loss: {summary['final_loss']:.4f}")
+            logger.info(f"Best Loss: {summary['best_loss']:.4f}")
+            logger.info(f"Valid Batches: {summary['total_valid_batches']}")
+            logger.info(f"Avg Valid Batches per Epoch: {summary['avg_valid_batches_per_epoch']:.1f}")
+            logger.info(f"Final Learning Rate: {summary['final_learning_rate']:.6f}")
+            
+        except Exception as e:
+            logger.error(f"Error plotting metrics: {str(e)}")
+            raise
+
+def worker_init_fn(worker_id):
+    """Initialize worker process with a unique seed"""
+    worker_seed = 42 + worker_id
+    torch.manual_seed(worker_seed)
+    np.random.seed(worker_seed)
+
 def train_siglip(config, dataset_path):
     """Main training function"""
     try:
         logger.info("Starting SigLIP training setup...")
         
-        # Set default tensor type to float32
-        torch.set_default_tensor_type(torch.FloatTensor)
+        # Initialize metrics tracker
+        metrics = TrainingMetrics()
+        
+        # Set default dtype and device
+        torch.set_default_dtype(torch.float32)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.set_default_device(device)
+        
+        # Set random seed for reproducibility
+        torch.manual_seed(42)
+        np.random.seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
         
         # Configure AMP
         if torch.cuda.is_available():
             logger.info("CUDA available, configuring AMP...")
             amp_dtype = torch.float16
             amp_enabled = True
+            # Create generator for DataLoader
+            generator = torch.Generator(device=device)
+            generator.manual_seed(42)
         else:
             logger.info("CUDA not available, using CPU with float32...")
             amp_dtype = torch.float32
             amp_enabled = False
+            generator = torch.Generator()
+            generator.manual_seed(42)
         
         # Initialize gradient scaler
         scaler = torch.amp.GradScaler(enabled=amp_enabled)
@@ -259,7 +423,10 @@ def train_siglip(config, dataset_path):
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
-            pin_memory=True
+            pin_memory=True,
+            generator=generator,
+            worker_init_fn=worker_init_fn,
+            persistent_workers=True if config.num_workers > 0 else False
         )
         
         # Initialize and configure tokenizer
@@ -371,7 +538,9 @@ def train_siglip(config, dataset_path):
                     # Gradient clipping
                     if amp_enabled:
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    
+                    # Calculate gradient norm for monitoring
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
                     
                     # Optimizer step
                     if amp_enabled:
@@ -381,6 +550,13 @@ def train_siglip(config, dataset_path):
                         optimizer.step()
                     
                     scheduler.step()
+                    
+                    # Update metrics
+                    metrics.update({
+                        'batch_loss': loss.item(),
+                        'grad_norm': grad_norm.item(),
+                        'amp_scale': scaler.get_scale() if amp_enabled else 1.0
+                    })
                     
                     # Update progress
                     epoch_loss += loss.item()
@@ -418,12 +594,20 @@ def train_siglip(config, dataset_path):
             # Log epoch statistics
             if valid_batches > 0:
                 avg_epoch_loss = epoch_loss / valid_batches
+                metrics.update_epoch({
+                    'avg_loss': avg_epoch_loss,
+                    'learning_rate': scheduler.get_last_lr()[0],
+                    'valid_batches': valid_batches
+                })
                 logger.info(f"Epoch {epoch + 1}/{config.num_epochs} - "
                            f"Average Loss: {avg_epoch_loss:.4f} "
                            f"(Valid batches: {valid_batches}/{len(dataloader)})")
             else:
                 logger.warning(f"Epoch {epoch + 1}/{config.num_epochs} - "
                              f"No valid batches processed")
+        
+        # Plot and save metrics
+        metrics.plot_metrics(save_dir)
         
         # Save final model
         final_model_path = os.path.join(save_dir, "final_model.pt")
