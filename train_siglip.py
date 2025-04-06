@@ -79,7 +79,7 @@ class CIFAR10SigLIPDataset(Dataset):
             logger.info(f"Successfully loaded {len(self.data)} samples from CSV")
             
             # Verify required columns exist
-            required_columns = ['Dataset_Index'] + [f'Q{i}' for i in range(1, 6)] + [f'A{i}' for i in range(1, 6)]
+            required_columns = ['Dataset_Index'] + [f'A{i}' for i in range(1, 6)]
             missing_columns = [col for col in required_columns if col not in self.data.columns]
             if missing_columns:
                 raise ValueError(f"Missing required columns in CSV: {', '.join(missing_columns)}")
@@ -127,14 +127,13 @@ class CIFAR10SigLIPDataset(Dataset):
             dataset_idx = int(self.data.iloc[image_idx]['Dataset_Index'])
             image, _ = self.cifar10[dataset_idx]
             
-            # Get question and answer pair
-            question = self.data.iloc[image_idx][f'Q{qa_idx}']
+            # Get answer
             answer = self.data.iloc[image_idx][f'A{qa_idx}']
             
             # Clean and combine text
-            question = str(question).strip()
             answer = str(answer).strip()
-            text = f"Question: {question} Answer: {answer}"
+            # text = f"Answer: {answer}"
+            text = f"{answer}"
             
             if self.transform:
                 try:

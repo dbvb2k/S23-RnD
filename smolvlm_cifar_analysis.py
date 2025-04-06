@@ -10,6 +10,7 @@ import time
 import os
 from datetime import datetime
 import csv
+import argparse
 
 NUM_DASHES = 150
 FLUSH_INTERVAL = 100  # Flush to CSV file every 100 images
@@ -49,19 +50,37 @@ def get_last_processed_index(output_file):
         print(f"Warning: Error reading last processed index: {e}")
         return -1
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='CIFAR10 Image Analysis with SmolVLM2')
+    parser.add_argument('--resume', type=str, help='Path to the CSV file to resume from')
+    parser.add_argument('--output-dir', type=str, default='output',
+                      help='Directory to save output files (default: output)')
+    return parser.parse_args()
+
 def main():
+    # Parse command line arguments
+    args = parse_arguments()
+    
     print("\n=== SmolVLM2 CIFAR10 Image Analysis ===")
     print("Starting the analysis process...\n")
 
     # Create output directory if it doesn't exist
-    output_dir = "output"
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Generate unique filename with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(output_dir, f"infer_test_{timestamp}.csv")
+    # Determine output file
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Resume file not found: {args.resume}")
+        output_file = args.resume
+        print(f"Resuming analysis from: {output_file}")
+    else:
+        # Generate new filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = os.path.join(args.output_dir, f"infer_test_{timestamp}.csv")
+        print(f"Starting new analysis, output will be saved to: {output_file}")
     
-    print(f"Results will be saved to: {output_file}\n")
+    print()  # Empty line for readability
 
     # Load CIFAR10 dataset
     print("Step 1: Loading CIFAR10 test dataset...")
@@ -224,7 +243,7 @@ def main():
         
         print(f"• Total available questions: {len(questions)}")
         print(f"• Will randomly select 5 questions per image")
-        print(f"• Total operations: {len(testset)} * 5 = {len(testset) * 5} image-question pairs")
+        print(f"• Total operations: {len(testset) * 5} image-question pairs")
         print(f"• Estimated time: {(len(testset) * 5 * 4.0) / 60:4.0f} minutes (at 4.0s per question)")
         print(f"• Data will be flushed to CSV every {FLUSH_INTERVAL} images\n")
         
@@ -239,7 +258,22 @@ def main():
         start_idx = last_processed_idx + 1
         
         if start_idx > 0:
-            print(f"Resuming from image {start_idx + 1} (previous run found)")
+            print(f"Resuming from image {start_idx + 1} ({start_idx} images already processed)")
+            print(f"Using existing file: {output_file}")
+        else:
+            print(f"Starting new analysis")
+            print(f"Creating new file: {output_file}")
+        
+        # Show processing information
+        remaining_images = len(testset) - start_idx
+        estimated_time = (remaining_images * 5 * 4.0) / 60  # 4.0 seconds per question
+        print(f"\nProcessing Information:")
+        print(f"• Images remaining    : {remaining_images:,}")
+        print(f"• Questions per image : 5")
+        print(f"• Total operations    : {remaining_images * 5:,}")
+        print(f"• Estimated time      : {estimated_time:4.0f} minutes")
+        print(f"• Auto-save interval  : Every {FLUSH_INTERVAL} images")
+        print("-"*NUM_DASHES)
         
         # Prepare CSV headers
         headers = ['Image_Number', 'Dataset_Index', 'Class_Label']
@@ -385,7 +419,9 @@ def main():
                 pass
         
         print(f"\n❌ Error during execution: {str(e)}")
-        print("Please check if you have the correct model access and all required dependencies.")
+        if args.resume:
+            print(f"\nTo resume from the last successful save, run:")
+            print(f"python {os.path.basename(__file__)} --resume {output_file}")
         raise
 
 if __name__ == "__main__":
