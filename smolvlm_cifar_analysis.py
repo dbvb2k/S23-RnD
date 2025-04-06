@@ -12,6 +12,7 @@ from datetime import datetime
 import csv
 
 NUM_DASHES = 150
+FLUSH_INTERVAL = 100  # Flush to CSV file every 100 images
 
 def transform_to_pil(tensor_image):
     """Convert a tensor image to PIL Image."""
@@ -25,6 +26,29 @@ def clean_text_for_csv(text):
         return ""
     return ' '.join(str(text).replace('\n', ' ').split())
 
+def get_last_processed_index(output_file):
+    """Get the last processed image index from the CSV file."""
+    if not os.path.exists(output_file):
+        return -1
+    
+    try:
+        with open(output_file, 'r', encoding='utf-8') as f:
+            # Skip header
+            next(f)
+            # Read all lines and get the last one
+            lines = f.readlines()
+            if not lines:
+                return -1
+            last_line = lines[-1].strip()
+            if not last_line:
+                return -1
+            # Extract image number from the first column
+            last_image_num = int(last_line.split(',')[0]) - 1  # Convert back to 0-based index
+            return last_image_num
+    except Exception as e:
+        print(f"Warning: Error reading last processed index: {e}")
+        return -1
+
 def main():
     print("\n=== SmolVLM2 CIFAR10 Image Analysis ===")
     print("Starting the analysis process...\n")
@@ -35,12 +59,12 @@ def main():
     
     # Generate unique filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(output_dir, f"infer_{timestamp}.csv")
+    output_file = os.path.join(output_dir, f"infer_test_{timestamp}.csv")
     
     print(f"Results will be saved to: {output_file}\n")
 
     # Load CIFAR10 dataset
-    print("Step 1: Loading CIFAR10 dataset...")
+    print("Step 1: Loading CIFAR10 test dataset...")
     print("-"*NUM_DASHES)
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -48,10 +72,10 @@ def main():
     ])
     
     start_time = time.time()
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
-                                          download=True, transform=transform)
-    print(f"✓ Dataset loaded successfully! ({len(trainset)} images available)")
-    print(f"✓ Available classes: {', '.join(trainset.classes)}\n")
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                         download=True, transform=transform)
+    print(f"✓ Test dataset loaded successfully! ({len(testset)} images available)")
+    print(f"✓ Available classes: {', '.join(testset.classes)}\n")
     
     # Load SmolVLM2 model and processor
     print("Step 2: Loading SmolVLM2 model and processor...")
@@ -71,10 +95,9 @@ def main():
         )
         print(f"✓ Model loaded successfully! (Using device: {model.device})\n")
         
-        # Sample 50 random images
+        # Process all test images
         print("Step 3: Preparing image analysis...")
         print("-"*NUM_DASHES)
-        sample_indices = random.sample(range(len(trainset)), 50)
         
         # Questions to ask about each image
         questions = [
@@ -201,7 +224,9 @@ def main():
         
         print(f"• Total available questions: {len(questions)}")
         print(f"• Will randomly select 5 questions per image")
-        print(f"• Total operations: 50 * 5 = 250 image-question pairs\n")
+        print(f"• Total operations: {len(testset)} * 5 = {len(testset) * 5} image-question pairs")
+        print(f"• Estimated time: {(len(testset) * 5 * 4.0) / 60:4.0f} minutes (at 4.0s per question)")
+        print(f"• Data will be flushed to CSV every {FLUSH_INTERVAL} images\n")
         
         # Process images and save results
         print("Step 4: Starting image analysis...")
@@ -209,17 +234,33 @@ def main():
         successful_analyses = 0
         failed_analyses = 0
         
+        # Check if we need to resume from a previous run
+        last_processed_idx = get_last_processed_index(output_file)
+        start_idx = last_processed_idx + 1
+        
+        if start_idx > 0:
+            print(f"Resuming from image {start_idx + 1} (previous run found)")
+        
         # Prepare CSV headers
         headers = ['Image_Number', 'Dataset_Index', 'Class_Label']
         for i in range(1, 6):  # 5 questions
             headers.extend([f'Q{i}', f'A{i}'])
+        headers.extend(['Concat_Q', 'Concat_A'])  # Add new concatenated columns
         
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        # Open file in append mode if resuming, write mode if starting fresh
+        file_mode = 'a' if start_idx > 0 else 'w'
+        with open(output_file, file_mode, newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(headers)
+            if file_mode == 'w':
+                writer.writerow(headers)
             
-            for idx, sample_idx in enumerate(tqdm(sample_indices, desc="Processing images", unit="image")):
-                image_tensor, label = trainset[sample_idx]
+            # Buffer for batch writing
+            rows_buffer = []
+            
+            for idx in tqdm(range(start_idx, len(testset)), 
+                          initial=start_idx, total=len(testset),
+                          desc="Processing images", unit="image"):
+                image_tensor, label = testset[idx]
                 image = transform_to_pil(image_tensor)
                 
                 # Randomly select 5 questions for this image
@@ -227,13 +268,14 @@ def main():
                 
                 # Prepare row data
                 row_data = [
-                    f"{idx + 1:02d}",  # Image Number
-                    str(sample_idx),    # Dataset Index
-                    trainset.classes[label]  # Class Label
+                    f"{idx + 1:05d}",  # Image Number (padded to 5 digits)
+                    str(idx),          # Dataset Index
+                    testset.classes[label]  # Class Label
                 ]
                 
                 question_success = 0
-                responses = []
+                questions_list = []  # Store questions for concatenation
+                answers_list = []    # Store answers for concatenation
                 
                 for qnum, question in enumerate(selected_questions, 1):
                     try:
@@ -275,41 +317,74 @@ def main():
                         response = response.replace("User:", "").replace("Assistant:", "").strip()
                         response = response.replace(question, "").strip()
                         
-                        row_data.extend([clean_text_for_csv(question), response])
+                        # Store cleaned question and response
+                        cleaned_question = clean_text_for_csv(question)
+                        questions_list.append(f'"{cleaned_question}"')
+                        answers_list.append(f'"{response}"')
+                        
+                        row_data.extend([cleaned_question, response])
                         question_success += 1
                         
                     except Exception as e:
                         error_msg = f"ERROR: {str(e)}"
+                        questions_list.append(f'"{clean_text_for_csv(question)}"')
+                        answers_list.append(f'"ERROR"')
                         row_data.extend([clean_text_for_csv(question), error_msg])
                         print(f"\n⚠️  Error on image {idx + 1}, Q{qnum}: {question[:30]}...")
                         print(f"   Error message: {str(e)}")
                         print(f"   Continuing with next question...")
                 
-                # Write the row to CSV
-                writer.writerow(row_data)
+                # Add concatenated columns
+                row_data.append(", ".join(questions_list))
+                row_data.append(", ".join(answers_list))
                 
+                # Add row to buffer
+                rows_buffer.append(row_data)
+                
+                # Update statistics
                 if question_success == len(selected_questions):
                     successful_analyses += 1
                 else:
                     failed_analyses += 1
                 
+                # Flush buffer to CSV file every FLUSH_INTERVAL images
+                if len(rows_buffer) >= FLUSH_INTERVAL:
+                    writer.writerows(rows_buffer)
+                    f.flush()  # Force write to disk
+                    rows_buffer = []  # Clear buffer
+                    print(f"\n✓ Progress saved at image {idx + 1}")
+                
                 # Add a small delay between images to prevent potential rate limiting
                 time.sleep(0.1)
+            
+            # Write any remaining rows in buffer
+            if rows_buffer:
+                writer.writerows(rows_buffer)
+                f.flush()
         
         # Final statistics
         total_time = time.time() - start_time
         print("\n=== Analysis Complete ===")
         print("-"*NUM_DASHES)
-        print(f"✓ Total images processed: 50")
+        print(f"✓ Total images processed: {len(testset)}")
         print(f"✓ Successful analyses: {successful_analyses}")
         print(f"⚠️  Failed analyses: {failed_analyses}")
         print(f"✓ Total time taken: {total_time:.2f} seconds")
-        print(f"✓ Average time per image: {total_time/50:.2f} seconds")
+        print(f"✓ Average time per image: {total_time/len(testset):.2f} seconds")
         print(f"\nResults have been saved to: {output_file}")
         print("="*NUM_DASHES)
         
     except Exception as e:
-        print(f"\n❌ Error during setup: {str(e)}")
+        # If we encounter an error, try to save any remaining buffered rows
+        if 'rows_buffer' in locals() and 'f' in locals() and 'writer' in locals():
+            try:
+                writer.writerows(rows_buffer)
+                f.flush()
+                print(f"\n✓ Saved buffered data before error")
+            except:
+                pass
+        
+        print(f"\n❌ Error during execution: {str(e)}")
         print("Please check if you have the correct model access and all required dependencies.")
         raise
 
