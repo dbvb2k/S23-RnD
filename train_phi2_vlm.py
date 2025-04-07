@@ -5,6 +5,34 @@ import time
 from datetime import datetime
 import argparse
 from typing import Dict, List, Optional, Tuple
+from importlib.metadata import version, PackageNotFoundError
+
+# Check required package versions
+required_packages = {
+    'bitsandbytes': '>=0.41.1',
+    'transformers': '>=4.36.0',
+    'peft': '>=0.7.0'
+}
+
+def check_package_version(package_name: str, min_version: str) -> bool:
+    try:
+        installed_version = version(package_name)
+        # Remove >= from version string
+        required_version = min_version.lstrip('>=')
+        # Simple version comparison - assumes semantic versioning
+        installed_parts = [int(x) for x in installed_version.split('.')]
+        required_parts = [int(x) for x in required_version.split('.')]
+        return installed_parts >= required_parts
+    except PackageNotFoundError:
+        return False
+
+# Verify package versions
+for package, version_req in required_packages.items():
+    if not check_package_version(package, version_req):
+        raise ImportError(
+            f"{package} {version_req} is required but not installed. "
+            f"Please run: pip install {package}{version_req}"
+        )
 
 # Data processing
 import numpy as np
