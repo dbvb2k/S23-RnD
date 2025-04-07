@@ -54,7 +54,7 @@ class Config:
     def __init__(self):
         # Model configuration
         self.base_model = "microsoft/phi-2"
-        self.siglip_checkpoint = "models/siglip_phi_cifar10_20250406_132505/final_model.pt"
+        self.siglip_checkpoint = None  # Will be set via command line argument
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # LoRA configuration
@@ -497,6 +497,8 @@ def main():
         parser = argparse.ArgumentParser(description='Train Phi-2 as VLM using QLoRA')
         parser.add_argument('--input-csv', type=str, required=True,
                           help='Path to the input CSV file')
+        parser.add_argument('--siglip-checkpoint', type=str, required=True,
+                          help='Path to the trained SigLIP model checkpoint')
         parser.add_argument('--batch-size', type=int, default=4,
                           help='Batch size for training')
         parser.add_argument('--num-epochs', type=int, default=3,
@@ -510,6 +512,7 @@ def main():
         config.batch_size = args.batch_size
         config.num_epochs = args.num_epochs
         config.learning_rate = args.learning_rate
+        config.siglip_checkpoint = args.siglip_checkpoint
         
         # Train model
         metrics = train_vlm(config, args.input_csv)
