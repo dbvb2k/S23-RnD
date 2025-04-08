@@ -256,7 +256,9 @@ class CIFAR10VLMDataset(Dataset):
                     self.text_lengths.append(len(encoded['input_ids'][0]))
                     self.total_items += 1
             
-            logger.info(f"Dataset initialized with {self.total_items} QA pairs")
+            logger.info(f"Dataset initialized with {self.total_items} QA pairs (valid indices: 0 to {self.total_items - 1})")
+            logger.info(f"Number of base images: {len(self.data)}")
+            logger.info(f"Number of answers per image: 5")
             
         except Exception as e:
             logger.error(f"Error initializing dataset: {str(e)}")
@@ -267,23 +269,26 @@ class CIFAR10VLMDataset(Dataset):
 
     def get_length(self, idx: int) -> int:
         """Return the length of the text at given index"""
-        if idx >= self.total_items:
-            raise IndexError(f"Index {idx} is out of bounds for dataset of size {self.total_items}")
+        if not 0 <= idx < self.total_items:
+            raise IndexError(f"Index {idx} is out of bounds for dataset of size {self.total_items} (valid indices: 0 to {self.total_items - 1})")
         return self.text_lengths[idx]
 
     def __getitem__(self, idx: int) -> Dict:
         try:
-            if idx >= self.total_items:
-                raise IndexError(f"Index {idx} is out of bounds for dataset of size {self.total_items}")
+            if not 0 <= idx < self.total_items:
+                raise IndexError(f"Index {idx} is out of bounds for dataset of size {self.total_items} (valid indices: 0 to {self.total_items - 1})")
                 
             # Calculate image index and answer index
             image_idx = idx // 5
             answer_idx = (idx % 5) + 1
             
+            if image_idx >= len(self.data):
+                raise IndexError(f"Calculated image_idx {image_idx} is out of bounds for data of size {len(self.data)}")
+            
             # Get image
             dataset_idx = int(self.data.iloc[image_idx]['Dataset_Index'])
-            if dataset_idx >= len(self.cifar10):
-                raise IndexError(f"Dataset index {dataset_idx} is out of bounds for CIFAR10 dataset")
+            if not 0 <= dataset_idx < len(self.cifar10):
+                raise IndexError(f"Dataset index {dataset_idx} is out of bounds for CIFAR10 dataset of size {len(self.cifar10)}")
                 
             image, _ = self.cifar10[dataset_idx]
             
@@ -309,6 +314,7 @@ class CIFAR10VLMDataset(Dataset):
             
         except Exception as e:
             logger.error(f"Error loading item {idx}: {str(e)}")
+            logger.error(f"Dataset size: {self.total_items}, Image count: {len(self.data)}, CIFAR10 size: {len(self.cifar10)}")
             raise
 
 class VLMDataCollator:
@@ -494,6 +500,10 @@ def train_vlm(config: Config, dataset_path: str):
             max_length=config.max_length
         )
         
+        # Calculate training steps
+        num_training_steps = int((len(train_dataset) / config.batch_size) * config.num_epochs)
+        save_steps = min(config.save_steps, num_training_steps // 10)  # Save at least 10 times during training
+        
         # Training arguments with optimizations
         training_args = TrainingArguments(
             output_dir=output_dir,
@@ -506,7 +516,7 @@ def train_vlm(config: Config, dataset_path: str):
             weight_decay=config.weight_decay,
             warmup_ratio=config.warmup_ratio,
             logging_steps=config.logging_steps,
-            save_steps=config.save_steps,
+            save_steps=save_steps,
             save_strategy="steps",
             eval_strategy="no",
             load_best_model_at_end=False,
@@ -522,10 +532,14 @@ def train_vlm(config: Config, dataset_path: str):
             group_by_length=config.use_length_sampler,
             save_total_limit=3,
             gradient_checkpointing=config.gradient_checkpointing,
-            torch_compile=config.torch_compile
+            torch_compile=config.torch_compile,
+            max_steps=num_training_steps,  # Add max_steps to prevent overrunning
+            disable_tqdm=False,  # Enable progress bar for better monitoring
+            log_level="info",
+            logging_first_step=True  # Log the first training step
         )
         
-        # Initialize trainer
+        # Initialize trainer with custom data collator
         trainer = VLMTrainer(
             siglip_model=siglip_model,
             processing_class=processing_class,
@@ -534,6 +548,14 @@ def train_vlm(config: Config, dataset_path: str):
             train_dataset=train_dataset,
             data_collator=VLMDataCollator(processing_class, config.max_length)
         )
+        
+        # Log dataset and training configuration
+        logger.info(f"Starting training with:")
+        logger.info(f"- Dataset size: {len(train_dataset)}")
+        logger.info(f"- Batch size: {config.batch_size}")
+        logger.info(f"- Gradient accumulation steps: {config.gradient_accumulation_steps}")
+        logger.info(f"- Total training steps: {num_training_steps}")
+        logger.info(f"- Save steps: {save_steps}")
         
         # Train
         logger.info("Starting training...")
