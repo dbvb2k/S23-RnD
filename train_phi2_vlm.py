@@ -100,20 +100,29 @@ class Config:
         
         # Training configuration
         self.max_length = 512
-        self.batch_size = 4
-        self.gradient_accumulation_steps = 4
+        self.batch_size = 8  # Increased from 4
+        self.gradient_accumulation_steps = 8  # Increased from 4
         self.num_epochs = 3
         self.learning_rate = 2e-4
         self.weight_decay = 0.01
         self.warmup_ratio = 0.03
         self.eval_steps = 100
-        self.save_steps = 500
-        self.logging_steps = 10
+        self.save_steps = 1000  # Increased from 500
+        self.logging_steps = 50  # Increased from 10
         
         # Dataset configuration
         self.image_size = 224
-        self.num_workers = 4
-        self.use_length_sampler = False  # Added configuration for sampler
+        self.num_workers = 8  # Increased from 4
+        self.use_length_sampler = True  # Enable length-based sampling
+        self.pin_memory = True  # Enable pinned memory
+        self.prefetch_factor = 2  # Enable prefetching
+        self.persistent_workers = True  # Keep workers alive between epochs
+        
+        # Optimization configuration
+        self.use_flash_attention = False  # Disabled by default due to triton dependency
+        self.use_bettertransformer = True  # Enable BetterTransformer
+        self.torch_compile = False  # Disabled by default when using quantization
+        self.gradient_checkpointing = True  # Enable gradient checkpointing
 
 class VLMPreprocessor:
     """Preprocessor class for VLM training"""
@@ -122,6 +131,9 @@ class VLMPreprocessor:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        
+        # Add model_input_names attribute required by Trainer
+        self.model_input_names = ['input_ids', 'attention_mask', 'labels']
     
     def __call__(self, text):
         return self.tokenizer(
@@ -224,7 +236,7 @@ class CIFAR10VLMDataset(Dataset):
             )
             
             # Verify required columns
-            required_columns = ['Dataset_Index'] + [f'Q{i}' for i in range(1, 6)] + [f'A{i}' for i in range(1, 6)]
+            required_columns = ['Dataset_Index'] + [f'A{i}' for i in range(1, 6)]
             missing_columns = [col for col in required_columns if col not in self.data.columns]
             if missing_columns:
                 raise ValueError(f"Missing columns: {missing_columns}")
@@ -233,46 +245,56 @@ class CIFAR10VLMDataset(Dataset):
             
             # Pre-compute text lengths for efficient sampling
             self.text_lengths = []
-            for idx in range(len(self.data) * 5):
-                image_idx = idx // 5
-                qa_idx = idx % 5 + 1
-                question = self.data.iloc[image_idx][f'Q{qa_idx}']
-                answer = self.data.iloc[image_idx][f'A{qa_idx}']
-                text = f"Question: {question}\nAnswer: {answer}"
-                encoded = self.processing_class(text)
-                self.text_lengths.append(len(encoded['input_ids'][0]))
+            self.total_items = 0
             
-            logger.info(f"Dataset initialized with {len(self.data) * 5} QA pairs")
+            # Calculate total items and pre-compute lengths
+            for idx in range(len(self.data)):
+                for qa_idx in range(1, 6):
+                    answer = self.data.iloc[idx][f'A{qa_idx}']
+                    text = f"Answer: {answer}"
+                    encoded = self.processing_class(text)
+                    self.text_lengths.append(len(encoded['input_ids'][0]))
+                    self.total_items += 1
+            
+            logger.info(f"Dataset initialized with {self.total_items} QA pairs")
             
         except Exception as e:
             logger.error(f"Error initializing dataset: {str(e)}")
             raise
 
     def __len__(self):
-        return len(self.data) * 5  # 5 QA pairs per image
+        return self.total_items
 
     def get_length(self, idx: int) -> int:
         """Return the length of the text at given index"""
+        if idx >= self.total_items:
+            raise IndexError(f"Index {idx} is out of bounds for dataset of size {self.total_items}")
         return self.text_lengths[idx]
 
     def __getitem__(self, idx: int) -> Dict:
         try:
+            if idx >= self.total_items:
+                raise IndexError(f"Index {idx} is out of bounds for dataset of size {self.total_items}")
+                
+            # Calculate image index and answer index
             image_idx = idx // 5
-            qa_idx = idx % 5 + 1
+            answer_idx = (idx % 5) + 1
             
             # Get image
-            dataset_idx = self.data.iloc[image_idx]['Dataset_Index']
+            dataset_idx = int(self.data.iloc[image_idx]['Dataset_Index'])
+            if dataset_idx >= len(self.cifar10):
+                raise IndexError(f"Dataset index {dataset_idx} is out of bounds for CIFAR10 dataset")
+                
             image, _ = self.cifar10[dataset_idx]
             
             if self.transform:
                 image = self.transform(image)
             
-            # Get Q&A pair
-            question = self.data.iloc[image_idx][f'Q{qa_idx}']
-            answer = self.data.iloc[image_idx][f'A{qa_idx}']
+            # Get answer
+            answer = self.data.iloc[image_idx][f'A{answer_idx}']
             
             # Format text
-            text = f"Question: {question}\nAnswer: {answer}"
+            text = f"Answer: {answer}"
             
             # Process text using processing_class
             encoded = self.processing_class(text)
@@ -281,7 +303,8 @@ class CIFAR10VLMDataset(Dataset):
                 'image': image,
                 'text': text,
                 'input_ids': encoded['input_ids'].squeeze(0),
-                'attention_mask': encoded['attention_mask'].squeeze(0)
+                'attention_mask': encoded['attention_mask'].squeeze(0),
+                'labels': encoded['input_ids'].squeeze(0)  # Add labels for training
             }
             
         except Exception as e:
@@ -332,7 +355,7 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Quantization config
+        # Quantization config with optimal settings
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -340,13 +363,43 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
             bnb_4bit_use_double_quant=True
         )
         
-        # Load model
+        # Check for Flash Attention availability
+        use_flash_attention = config.use_flash_attention
+        if use_flash_attention:
+            try:
+                import flash_attn
+                logger.info("Flash Attention 2 is available and will be used")
+            except ImportError:
+                logger.warning("Flash Attention 2 is not available. Falling back to standard attention.")
+                use_flash_attention = False
+        
+        # Load model with optimizations
+        model_kwargs = {
+            "quantization_config": bnb_config,
+            "device_map": "auto",
+            "trust_remote_code": True,
+            "torch_dtype": torch.float16,
+        }
+        
+        if use_flash_attention:
+            model_kwargs["use_flash_attention_2"] = True
+        
         model = AutoModelForCausalLM.from_pretrained(
             config.base_model,
-            quantization_config=bnb_config,
-            device_map="auto",
-            trust_remote_code=True
+            **model_kwargs
         )
+        
+        # Enable gradient checkpointing
+        if config.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+        
+        # Enable better transformer
+        if config.use_bettertransformer:
+            try:
+                model = model.to_bettertransformer()
+                logger.info("BetterTransformer optimization enabled")
+            except Exception as e:
+                logger.warning(f"Failed to enable BetterTransformer: {str(e)}")
         
         # Find all possible target modules
         if not config.lora_target_modules:
@@ -441,7 +494,7 @@ def train_vlm(config: Config, dataset_path: str):
             max_length=config.max_length
         )
         
-        # Training arguments
+        # Training arguments with optimizations
         training_args = TrainingArguments(
             output_dir=output_dir,
             run_name=run_name,
@@ -460,11 +513,16 @@ def train_vlm(config: Config, dataset_path: str):
             report_to=["tensorboard", "wandb"],
             remove_unused_columns=False,
             fp16=True,
+            bf16=False,  # Disable bfloat16 when using flash attention
             optim="paged_adamw_32bit",
             dataloader_num_workers=config.num_workers,
-            dataloader_pin_memory=True,
+            dataloader_pin_memory=config.pin_memory,
+            dataloader_prefetch_factor=config.prefetch_factor,
+            dataloader_persistent_workers=config.persistent_workers,
             group_by_length=config.use_length_sampler,
-            save_total_limit=3
+            save_total_limit=3,
+            gradient_checkpointing=config.gradient_checkpointing,
+            torch_compile=config.torch_compile
         )
         
         # Initialize trainer
