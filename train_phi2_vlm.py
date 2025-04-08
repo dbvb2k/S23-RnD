@@ -1,3 +1,4 @@
+import math
 import os
 import json
 import logging
@@ -40,7 +41,7 @@ import pandas as pd
 from PIL import Image
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import torchvision
 import torchvision.transforms as transforms
 
@@ -341,6 +342,18 @@ class VLMDataCollator:
         
         return batch
 
+class SafeSequentialSampler(Sampler):
+    """A sequential sampler that ensures we never go beyond dataset bounds"""
+    def __init__(self, data_source):
+        self.data_source = data_source
+        self.total_size = len(self.data_source)
+
+    def __iter__(self):
+        return iter(range(self.total_size))
+
+    def __len__(self):
+        return self.total_size
+
 def find_target_modules(model) -> List[str]:
     """Find all linear layer names in the model for LoRA targeting"""
     target_modules = set()
@@ -500,9 +513,19 @@ def train_vlm(config: Config, dataset_path: str):
             max_length=config.max_length
         )
         
-        # Calculate training steps
-        num_training_steps = int((len(train_dataset) / config.batch_size) * config.num_epochs)
-        save_steps = min(config.save_steps, num_training_steps // 10)  # Save at least 10 times during training
+        # Calculate training steps and effective batch size
+        effective_batch_size = config.batch_size * config.gradient_accumulation_steps
+        total_size = len(train_dataset)
+        steps_per_epoch = math.ceil(total_size / effective_batch_size)
+        num_training_steps = steps_per_epoch * config.num_epochs
+        save_steps = min(config.save_steps, num_training_steps // 10)
+        
+        logger.info(f"Training configuration:")
+        logger.info(f"- Total dataset size: {total_size}")
+        logger.info(f"- Effective batch size: {effective_batch_size}")
+        logger.info(f"- Steps per epoch: {steps_per_epoch}")
+        logger.info(f"- Total training steps: {num_training_steps}")
+        logger.info(f"- Save steps: {save_steps}")
         
         # Training arguments with optimizations
         training_args = TrainingArguments(
@@ -529,17 +552,17 @@ def train_vlm(config: Config, dataset_path: str):
             dataloader_pin_memory=config.pin_memory,
             dataloader_prefetch_factor=config.prefetch_factor,
             dataloader_persistent_workers=config.persistent_workers,
-            group_by_length=config.use_length_sampler,
+            group_by_length=False,  # Disable length sampling to use our custom sampler
             save_total_limit=3,
             gradient_checkpointing=config.gradient_checkpointing,
             torch_compile=config.torch_compile,
-            max_steps=num_training_steps,  # Add max_steps to prevent overrunning
-            disable_tqdm=False,  # Enable progress bar for better monitoring
+            max_steps=num_training_steps,
+            disable_tqdm=False,
             log_level="info",
-            logging_first_step=True  # Log the first training step
+            logging_first_step=True
         )
         
-        # Initialize trainer with custom data collator
+        # Initialize trainer with custom sampler
         trainer = VLMTrainer(
             siglip_model=siglip_model,
             processing_class=processing_class,
@@ -549,13 +572,20 @@ def train_vlm(config: Config, dataset_path: str):
             data_collator=VLMDataCollator(processing_class, config.max_length)
         )
         
-        # Log dataset and training configuration
-        logger.info(f"Starting training with:")
-        logger.info(f"- Dataset size: {len(train_dataset)}")
-        logger.info(f"- Batch size: {config.batch_size}")
-        logger.info(f"- Gradient accumulation steps: {config.gradient_accumulation_steps}")
-        logger.info(f"- Total training steps: {num_training_steps}")
-        logger.info(f"- Save steps: {save_steps}")
+        # Override the default sampler with our safe sampler
+        def get_train_dataloader():
+            return DataLoader(
+                train_dataset,
+                batch_size=training_args.per_device_train_batch_size,
+                sampler=SafeSequentialSampler(train_dataset),
+                num_workers=training_args.dataloader_num_workers,
+                pin_memory=training_args.dataloader_pin_memory,
+                prefetch_factor=training_args.dataloader_prefetch_factor,
+                persistent_workers=training_args.dataloader_persistent_workers,
+                collate_fn=trainer.data_collator
+            )
+        
+        trainer.get_train_dataloader = get_train_dataloader
         
         # Train
         logger.info("Starting training...")
