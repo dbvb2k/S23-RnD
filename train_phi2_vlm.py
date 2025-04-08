@@ -101,29 +101,35 @@ class Config:
         
         # Training configuration
         self.max_length = 512
-        self.batch_size = 8  # Increased from 4
-        self.gradient_accumulation_steps = 8  # Increased from 4
+        self.batch_size = 16  # Increased batch size
+        self.gradient_accumulation_steps = 16  # Increased gradient accumulation
         self.num_epochs = 3
-        self.learning_rate = 2e-4
+        self.learning_rate = 4e-4  # Increased learning rate to compensate for larger batch size
         self.weight_decay = 0.01
         self.warmup_ratio = 0.03
         self.eval_steps = 100
-        self.save_steps = 1000  # Increased from 500
-        self.logging_steps = 50  # Increased from 10
+        self.save_steps = 1000
+        self.logging_steps = 50
         
         # Dataset configuration
         self.image_size = 224
-        self.num_workers = 8  # Increased from 4
-        self.use_length_sampler = True  # Enable length-based sampling
-        self.pin_memory = True  # Enable pinned memory
-        self.prefetch_factor = 2  # Enable prefetching
-        self.persistent_workers = True  # Keep workers alive between epochs
+        self.num_workers = 16  # Increased number of workers
+        self.pin_memory = True
+        self.prefetch_factor = 4  # Increased prefetch factor
+        self.persistent_workers = True
+        self.use_length_sampler = False  # Disabled for custom sampler
         
         # Optimization configuration
-        self.use_flash_attention = False  # Disabled by default due to triton dependency
-        self.use_bettertransformer = True  # Enable BetterTransformer
-        self.torch_compile = False  # Disabled by default when using quantization
-        self.gradient_checkpointing = True  # Enable gradient checkpointing
+        self.use_flash_attention = True  # Enable Flash Attention 2
+        self.use_bettertransformer = True
+        self.torch_compile = False
+        self.gradient_checkpointing = True
+        
+        # Memory optimization
+        self.max_grad_norm = 1.0  # Add gradient clipping
+        self.optim_type = "paged_adamw_32bit"  # Use paged optimizer
+        self.mixed_precision = True  # Enable mixed precision training
+        self.cache_dir = "./cache"  # Add cache directory for faster loading
 
 class VLMPreprocessor:
     """Preprocessor class for VLM training"""
@@ -369,17 +375,24 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
     try:
         logger.info("Setting up model and tokenizer...")
         
-        # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(config.base_model)
+        # Create cache directory
+        os.makedirs(config.cache_dir, exist_ok=True)
+        
+        # Load tokenizer with caching
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.base_model,
+            cache_dir=config.cache_dir
+        )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Quantization config with optimal settings
+        # Optimized quantization config
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True
+            bnb_4bit_use_double_quant=True,
+            llm_int8_has_fp16_weight=True  # Enable INT8 weights
         )
         
         # Check for Flash Attention availability
@@ -398,24 +411,28 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
             "device_map": "auto",
             "trust_remote_code": True,
             "torch_dtype": torch.float16,
+            "cache_dir": config.cache_dir,
         }
         
         if use_flash_attention:
             model_kwargs["use_flash_attention_2"] = True
+            model_kwargs["attention_dropout"] = 0.1  # Add dropout for stability
         
         model = AutoModelForCausalLM.from_pretrained(
             config.base_model,
             **model_kwargs
         )
         
-        # Enable gradient checkpointing
+        # Enable memory efficient optimizations
         if config.gradient_checkpointing:
             model.gradient_checkpointing_enable()
+            model.enable_input_require_grads()  # Enable input gradients for checkpointing
         
         # Enable better transformer
         if config.use_bettertransformer:
             try:
-                model = model.to_bettertransformer()
+                from optimum.bettertransformer import BetterTransformer
+                model = BetterTransformer.transform(model)
                 logger.info("BetterTransformer optimization enabled")
             except Exception as e:
                 logger.warning(f"Failed to enable BetterTransformer: {str(e)}")
@@ -425,17 +442,22 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
             config.lora_target_modules = find_target_modules(model)
             logger.info(f"Automatically found target modules: {config.lora_target_modules}")
         
-        # Prepare model for k-bit training
-        model = prepare_model_for_kbit_training(model)
+        # Prepare model for k-bit training with memory optimizations
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=config.gradient_checkpointing
+        )
         
-        # LoRA config
+        # Optimized LoRA config
         lora_config = LoraConfig(
             r=config.lora_r,
             lora_alpha=config.lora_alpha,
             target_modules=config.lora_target_modules,
             lora_dropout=config.lora_dropout,
             bias="none",
-            task_type=TaskType.CAUSAL_LM
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            use_rslora=True  # Enable rank-stabilized LoRA
         )
         
         # Get PEFT model
@@ -444,7 +466,7 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
         # Print trainable parameters
         model.print_trainable_parameters()
         
-        logger.info("Model and tokenizer setup complete")
+        logger.info("Model and tokenizer setup complete with optimizations")
         return model, tokenizer
     
     except Exception as e:
