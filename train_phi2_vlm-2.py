@@ -101,8 +101,8 @@ class Config:
         
         # Training configuration
         self.max_length = 512
-        self.batch_size = 16  # Increased batch size
-        self.gradient_accumulation_steps = 16  # Increased gradient accumulation
+        self.batch_size = 32  # Increased batch size
+        self.gradient_accumulation_steps = 8  # Increased gradient accumulation
         self.num_epochs = 3
         self.learning_rate = 4e-4  # Increased learning rate to compensate for larger batch size
         self.weight_decay = 0.01
@@ -684,6 +684,8 @@ def main():
                           help='Number of training epochs')
         parser.add_argument('--learning-rate', type=float, default=2e-4,
                           help='Learning rate')
+        parser.add_argument('--gradient-accumulation-steps', type=int, default=8,
+                          help='Gradient accumulation steps')
         args = parser.parse_args()
         
         # Initialize config
@@ -692,6 +694,7 @@ def main():
         config.num_epochs = args.num_epochs
         config.learning_rate = args.learning_rate
         config.siglip_checkpoint = args.siglip_checkpoint
+        config.gradient_accumulation_steps = args.gradient_accumulation_steps
         
         # Train model
         metrics = train_vlm(config, args.input_csv)
