@@ -2,38 +2,13 @@ import math
 import os
 import json
 import logging
+import sys
 import time
 from datetime import datetime
 import argparse
 from typing import Dict, List, Optional, Tuple
 from importlib.metadata import version, PackageNotFoundError
-
-# Check required package versions
-required_packages = {
-    'bitsandbytes': '>=0.41.1',
-    'transformers': '>=4.36.0',
-    'peft': '>=0.7.0'
-}
-
-def check_package_version(package_name: str, min_version: str) -> bool:
-    try:
-        installed_version = version(package_name)
-        # Remove >= from version string
-        required_version = min_version.lstrip('>=')
-        # Simple version comparison - assumes semantic versioning
-        installed_parts = [int(x) for x in installed_version.split('.')]
-        required_parts = [int(x) for x in required_version.split('.')]
-        return installed_parts >= required_parts
-    except PackageNotFoundError:
-        return False
-
-# Verify package versions
-for package, version_req in required_packages.items():
-    if not check_package_version(package, version_req):
-        raise ImportError(
-            f"{package} {version_req} is required but not installed. "
-            f"Please run: pip install {package}{version_req}"
-        )
+import random
 
 # Data processing
 import numpy as np
@@ -67,16 +42,243 @@ from tqdm import tqdm
 import wandb
 from torch.utils.tensorboard import SummaryWriter
 
-# Set up logging
+# Check required package versions
+required_packages = {
+    'bitsandbytes': '>=0.41.1',
+    'transformers': '>=4.36.0',
+    'peft': '>=0.7.0'
+}
+
+def check_package_version(package_name: str, min_version: str) -> bool:
+    try:
+        installed_version = version(package_name)
+        # Remove >= from version string
+        required_version = min_version.lstrip('>=')
+        # Simple version comparison - assumes semantic versioning
+        installed_parts = [int(x) for x in installed_version.split('.')]
+        required_parts = [int(x) for x in required_version.split('.')]
+        return installed_parts >= required_parts
+    except PackageNotFoundError:
+        return False
+
+# Verify package versions
+for package, version_req in required_packages.items():
+    if not check_package_version(package, version_req):
+        raise ImportError(
+            f"{package} {version_req} is required but not installed. "
+            f"Please run: pip install {package}{version_req}"
+        )
+        
+# Create a basic logger initially (will be replaced with session-specific logger)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('training_vlm.log')
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def setup_logging(run_name):
+    """Set up logging to both console and file"""
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join("logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Create a unique log file name for this training session
+    log_file = os.path.join(logs_dir, f"{run_name}.log")
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove any existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # File handler for the unique log file
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    
+    # Add handlers to root logger
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    # Also configure our module logger
+    module_logger = logging.getLogger(__name__)
+    
+    # Log initial message
+    module_logger.info(f"Starting new training session: {run_name}")
+    module_logger.info(f"Logs will be saved to: {log_file}")
+    
+    return module_logger
+
+# Checkpoint manager
+class CheckpointManager:
+    """Manages model checkpoints for saving and resuming training"""
+    def __init__(self, output_dir: str, model_name: str = None, logger=None):
+        self.output_dir = output_dir
+        self.checkpoints_dir = os.path.join(output_dir, "checkpoints")
+        self.logger = logger or logging.getLogger(__name__)
+        self.model_name = model_name or "model"
+        
+        # Create checkpoint directory
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
+        self.logger.info(f"Checkpoint directory created at: {self.checkpoints_dir}")
+        
+        # Initialize checkpoint info file
+        self.checkpoint_info_file = os.path.join(self.output_dir, "checkpoint_info.json")
+        if not os.path.exists(self.checkpoint_info_file):
+            self._save_checkpoint_info({
+                "last_checkpoint": None,
+                "best_checkpoint": None,
+                "last_step": 0,
+                "best_loss": float("inf"),
+                "training_history": []
+            })
+    
+    def _save_checkpoint_info(self, info: dict):
+        """Save checkpoint info to a JSON file"""
+        with open(self.checkpoint_info_file, "w") as f:
+            json.dump(info, f, indent=4)
+    
+    def _load_checkpoint_info(self) -> dict:
+        """Load checkpoint info from a JSON file"""
+        if os.path.exists(self.checkpoint_info_file):
+            with open(self.checkpoint_info_file, "r") as f:
+                return json.load(f)
+        return {
+            "last_checkpoint": None,
+            "best_checkpoint": None,
+            "last_step": 0,
+            "best_loss": float("inf"),
+            "training_history": []
+        }
+    
+    def save_checkpoint(self, trainer, step: int, loss: float, is_best: bool = False):
+        """Save a checkpoint at the given step"""
+        try:
+            # Create checkpoint name
+            checkpoint_name = f"{self.model_name}_step_{step}.pt"
+            checkpoint_path = os.path.join(self.checkpoints_dir, checkpoint_name)
+            
+            # Load current info
+            info = self._load_checkpoint_info()
+            
+            # Save model, optimizer, and scheduler state
+            checkpoint = {
+                "step": step,
+                "model_state_dict": trainer.model.state_dict(),
+                "optimizer_state_dict": trainer.optimizer.state_dict() if trainer.optimizer else None,
+                "scheduler_state_dict": trainer.lr_scheduler.state_dict() if trainer.lr_scheduler else None,
+                "scaler_state_dict": trainer.scaler.state_dict() if hasattr(trainer, "scaler") and trainer.scaler else None,
+                "trainer_state": trainer.state.serialize(),
+                "rng_state": {
+                    "python": random.getstate(),
+                    "numpy": np.random.get_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    "torch": torch.get_rng_state()
+                },
+                "loss": loss,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # Save checkpoint
+            torch.save(checkpoint, checkpoint_path)
+            
+            # Update info
+            info["last_checkpoint"] = checkpoint_name
+            info["last_step"] = step
+            
+            # Add to training history
+            history_entry = {
+                "step": step,
+                "loss": loss,
+                "checkpoint": checkpoint_name,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            info["training_history"].append(history_entry)
+            
+            # Update best checkpoint if applicable
+            if is_best or loss < info["best_loss"]:
+                info["best_checkpoint"] = checkpoint_name
+                info["best_loss"] = loss
+                self.logger.info(f"New best checkpoint at step {step} with loss {loss:.4f}")
+            
+            # Save updated info
+            self._save_checkpoint_info(info)
+            
+            self.logger.info(f"Checkpoint saved at step {step} to {checkpoint_path}")
+            return checkpoint_path
+            
+        except Exception as e:
+            self.logger.error(f"Error saving checkpoint: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return None
+    
+    def load_latest_checkpoint(self, trainer):
+        """Load the latest checkpoint if available"""
+        info = self._load_checkpoint_info()
+        
+        if info["last_checkpoint"] is None:
+            self.logger.info("No checkpoint found. Starting training from scratch.")
+            return 0
+        
+        checkpoint_path = os.path.join(self.checkpoints_dir, info["last_checkpoint"])
+        return self.load_checkpoint(trainer, checkpoint_path)
+    
+    def load_checkpoint(self, trainer, checkpoint_path):
+        """Load a specific checkpoint"""
+        try:
+            if not os.path.exists(checkpoint_path):
+                self.logger.warning(f"Checkpoint {checkpoint_path} not found. Starting from scratch.")
+                return 0
+            
+            self.logger.info(f"Loading checkpoint from {checkpoint_path}")
+            
+            # Load checkpoint to CPU first to avoid OOM issues
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            
+            # Restore model state
+            trainer.model.load_state_dict(checkpoint["model_state_dict"])
+            
+            # Restore optimizer state if available
+            if checkpoint["optimizer_state_dict"] and trainer.optimizer:
+                trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            
+            # Restore scheduler state if available
+            if checkpoint["scheduler_state_dict"] and trainer.lr_scheduler:
+                trainer.lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            
+            # Restore scaler state if available
+            if checkpoint.get("scaler_state_dict") and hasattr(trainer, "scaler") and trainer.scaler:
+                trainer.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            
+            # Restore trainer state
+            if checkpoint.get("trainer_state"):
+                trainer.state = TrainingArguments.State.from_serialized(checkpoint["trainer_state"])
+            
+            # Restore RNG states
+            if checkpoint.get("rng_state"):
+                rng_state = checkpoint["rng_state"]
+                random.setstate(rng_state["python"])
+                np.random.set_state(rng_state["numpy"])
+                if torch.cuda.is_available() and rng_state.get("cuda"):
+                    torch.cuda.set_rng_state_all(rng_state["cuda"])
+                torch.set_rng_state(rng_state["torch"])
+            
+            self.logger.info(f"Successfully loaded checkpoint from step {checkpoint['step']} with loss {checkpoint['loss']:.4f}")
+            return checkpoint["step"]
+            
+        except Exception as e:
+            self.logger.error(f"Error loading checkpoint: {str(e)}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return 0 
 
 class Config:
     """Configuration for VLM training"""
@@ -164,11 +366,12 @@ class VLMPreprocessor:
 
 class VLMTrainer(Trainer):
     """Custom trainer for VLM with image encoding"""
-    def __init__(self, siglip_model, processing_class, *args, **kwargs):
+    def __init__(self, siglip_model, processing_class, checkpoint_manager=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.siglip_model = siglip_model
         self.siglip_model.eval()
         self.processing_class = processing_class
+        self.checkpoint_manager = checkpoint_manager
         
         # Initialize metrics
         self.train_metrics = {
@@ -181,6 +384,9 @@ class VLMTrainer(Trainer):
         # Time tracking
         self.start_time = time.time()
         self.total_tokens = 0
+        self.last_checkpoint_step = 0
+        self.checkpoint_interval = 100  # Save checkpoint every N steps
+        self.best_loss = float('inf')
         
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         try:
@@ -232,12 +438,77 @@ class VLMTrainer(Trainer):
                     'train/epoch': self.state.epoch,
                     'train/global_step': self.state.global_step
                 })
+                
+                # Save checkpoint if checkpoint manager is available and it's time to save
+                if self.checkpoint_manager and self.state.global_step - self.last_checkpoint_step >= self.checkpoint_interval:
+                    self.save_checkpoint(loss.item())
+            
+            # Update best loss and save best checkpoint
+            if self.checkpoint_manager and loss.item() < self.best_loss:
+                self.best_loss = loss.item()
+                # Save as best checkpoint
+                if self.state.global_step > 0 and self.state.global_step % 50 == 0:  # Don't save too often
+                    self.save_checkpoint(loss.item(), is_best=True)
             
             return (loss, outputs) if return_outputs else loss
             
         except Exception as e:
             logger.error(f"Error in compute_loss: {str(e)}")
             raise
+    
+    def save_checkpoint(self, loss, is_best=False):
+        """Save checkpoint using the checkpoint manager"""
+        if not self.checkpoint_manager:
+            return
+        
+        step = self.state.global_step
+        self.checkpoint_manager.save_checkpoint(self, step, loss, is_best=is_best)
+        self.last_checkpoint_step = step
+    
+    def load_checkpoint(self, checkpoint_path=None):
+        """Load checkpoint using the checkpoint manager"""
+        if not self.checkpoint_manager:
+            return 0
+        
+        if checkpoint_path:
+            return self.checkpoint_manager.load_checkpoint(self, checkpoint_path)
+        else:
+            return self.checkpoint_manager.load_latest_checkpoint(self)
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        """Save final checkpoint when training ends"""
+        super().on_train_end(args, state, control, **kwargs)
+        
+        if self.checkpoint_manager:
+            # Get the latest loss
+            loss = self.state.log_history[-1].get('loss', 0.0) if self.state.log_history else 0.0
+            self.save_checkpoint(loss)
+            logger.info(f"Final checkpoint saved at step {self.state.global_step}")
+    
+    def train(self, resume_from_checkpoint=None, **kwargs):
+        """Override train to support resuming from checkpoint"""
+        # Resume from checkpoint if specified
+        starting_step = 0
+        if resume_from_checkpoint:
+            if isinstance(resume_from_checkpoint, bool) and resume_from_checkpoint:
+                # If True, load the latest checkpoint
+                starting_step = self.load_checkpoint()
+                logger.info(f"Resuming training from step {starting_step}")
+            elif isinstance(resume_from_checkpoint, str):
+                # If string, load from specified path
+                starting_step = self.load_checkpoint(resume_from_checkpoint)
+                logger.info(f"Resuming training from checkpoint {resume_from_checkpoint} at step {starting_step}")
+        
+        # Update checkpoint interval based on save_steps
+        if hasattr(self.args, 'save_steps') and self.args.save_steps > 0:
+            # Use smaller of save_steps or our default
+            self.checkpoint_interval = min(self.args.save_steps, self.checkpoint_interval)
+        
+        # Set last checkpoint step to starting step
+        self.last_checkpoint_step = starting_step
+        
+        # Call parent train
+        return super().train(resume_from_checkpoint=resume_from_checkpoint, **kwargs)
 
 class CIFAR10VLMDataset(Dataset):
     """Dataset for VLM training using CIFAR10"""
@@ -517,11 +788,17 @@ def load_siglip_model(config: Config) -> nn.Module:
         logger.error(f"Error loading SigLIP model: {str(e)}")
         raise
 
-def train_vlm(config: Config, dataset_path: str):
+def train_vlm(config: Config, dataset_path: str, resume_from=None):
     """Main training function"""
     try:
-        # Initialize wandb with a unique run name
+        # Create a unique run name for this training session
         run_name = f"phi2_vlm_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Set up logging for this training session
+        global logger
+        logger = setup_logging(run_name)
+        
+        # Initialize wandb with the unique run name
         wandb.init(project="phi2-vlm", name=run_name, config=vars(config))
         
         # Setup tensorboard
@@ -530,6 +807,11 @@ def train_vlm(config: Config, dataset_path: str):
         # Create output directory
         output_dir = os.path.join("models", run_name)
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Log detailed training configuration
+        logger.info(f"Training configuration details:")
+        for key, value in vars(config).items():
+            logger.info(f"  {key}: {value}")
         
         # Load models
         model, tokenizer = setup_model_and_tokenizer(config)
@@ -567,6 +849,9 @@ def train_vlm(config: Config, dataset_path: str):
         logger.info(f"- Steps per epoch: {steps_per_epoch}")
         logger.info(f"- Total training steps: {num_training_steps}")
         logger.info(f"- Save steps: {save_steps}")
+        
+        # Create checkpoint manager
+        checkpoint_manager = CheckpointManager(output_dir, model_name="phi2_vlm", logger=logger)
         
         # Training arguments with optimizations
         training_args = TrainingArguments(
@@ -610,7 +895,8 @@ def train_vlm(config: Config, dataset_path: str):
             model=model,
             args=training_args,
             train_dataset=train_dataset,
-            data_collator=VLMDataCollator(processing_class, config.max_length)
+            data_collator=VLMDataCollator(processing_class, config.max_length),
+            checkpoint_manager=checkpoint_manager
         )
         
         # Override the default sampler with our safe sampler
@@ -628,9 +914,17 @@ def train_vlm(config: Config, dataset_path: str):
         
         trainer.get_train_dataloader = get_train_dataloader
         
+        # Check if we're resuming training
+        resume_training = False
+        if resume_from:
+            logger.info(f"Will attempt to resume training from: {resume_from}")
+            resume_training = True
+        
         # Train
         logger.info("Starting training...")
-        train_result = trainer.train()
+        start_time = time.time()
+        train_result = trainer.train(resume_from_checkpoint=resume_training)
+        training_time = time.time() - start_time
         
         # Save final model
         trainer.save_model()
@@ -647,7 +941,7 @@ def train_vlm(config: Config, dataset_path: str):
         final_metrics = {
             'final_loss': trainer.state.log_history[-1].get('loss', None),
             'avg_tokens_per_second': np.mean(trainer.train_metrics['tokens_per_second']),
-            'total_training_time': time.time() - trainer.start_time,
+            'total_training_time': training_time,
             'total_steps': trainer.state.global_step,
             'training_loss': train_result.training_loss,
             'epoch': train_result.epoch
@@ -664,6 +958,9 @@ def train_vlm(config: Config, dataset_path: str):
         with open(os.path.join(output_dir, "training_metrics.json"), "w") as f:
             json.dump(final_metrics, f, indent=4)
         
+        # Log the path to the trained model
+        logger.info(f"Trained model saved to: {output_dir}")
+        
         return final_metrics
     
     except Exception as e:
@@ -672,6 +969,10 @@ def train_vlm(config: Config, dataset_path: str):
 
 def main():
     """Main function"""
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join("logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    
     try:
         parser = argparse.ArgumentParser(description='Train Phi-2 as VLM using QLoRA')
         parser.add_argument('--input-csv', type=str, required=True,
@@ -686,7 +987,28 @@ def main():
                           help='Learning rate')
         parser.add_argument('--gradient-accumulation-steps', type=int, default=8,
                           help='Gradient accumulation steps')
+        parser.add_argument('--resume', action='store_true',
+                          help='Resume training from the last checkpoint')
+        parser.add_argument('--checkpoint-dir', type=str,
+                          help='Directory containing checkpoints to resume from (looks for the latest checkpoint)')
         args = parser.parse_args()
+        
+        # Verify input files exist
+        if not os.path.exists(args.input_csv):
+            raise FileNotFoundError(f"Input CSV file not found: {args.input_csv}")
+        if not os.path.exists(args.siglip_checkpoint):
+            raise FileNotFoundError(f"SigLIP checkpoint file not found: {args.siglip_checkpoint}")
+        
+        # Check resume options
+        resume_from = None
+        if args.resume:
+            resume_from = True
+            logger.info("Will attempt to resume training from the last checkpoint")
+        elif args.checkpoint_dir:
+            if not os.path.exists(args.checkpoint_dir):
+                raise FileNotFoundError(f"Checkpoint directory not found: {args.checkpoint_dir}")
+            resume_from = args.checkpoint_dir
+            logger.info(f"Will attempt to resume training from checkpoint directory: {args.checkpoint_dir}")
         
         # Initialize config
         config = Config()
@@ -696,13 +1018,32 @@ def main():
         config.siglip_checkpoint = args.siglip_checkpoint
         config.gradient_accumulation_steps = args.gradient_accumulation_steps
         
+        # Log input arguments
+        logger.info("Starting training with arguments:")
+        logger.info(f"  Input CSV: {args.input_csv}")
+        logger.info(f"  SigLIP checkpoint: {args.siglip_checkpoint}")
+        logger.info(f"  Batch size: {args.batch_size}")
+        logger.info(f"  Number of epochs: {args.num_epochs}")
+        logger.info(f"  Learning rate: {args.learning_rate}")
+        logger.info(f"  Gradient accumulation steps: {args.gradient_accumulation_steps}")
+        logger.info(f"  Resume training: {args.resume}")
+        if args.checkpoint_dir:
+            logger.info(f"  Checkpoint directory: {args.checkpoint_dir}")
+        
         # Train model
-        metrics = train_vlm(config, args.input_csv)
+        metrics = train_vlm(config, args.input_csv, resume_from=resume_from)
         logger.info("Training completed successfully")
         
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {str(e)}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error in main function: {str(e)}")
-        raise
+        # Print the full traceback for debugging
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(1)
 
 if __name__ == "__main__":
     main() 
+
