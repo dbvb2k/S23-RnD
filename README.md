@@ -168,36 +168,39 @@ Below are screenshots from the training process, showcasing the model's performa
 
 ### SigLIP Training
 
-<img src="images/siglip_train_scr1.png" width="600" alt="SigLIP Training Loss over Epochs">
+<img src="images/siglip_train_scr1.png" width="800" alt="SigLIP Training Loss over Epochs">
 <br><br>
-<img src="images/siglip_train_scr2.png" width="600" alt="SigLIP Training Loss over Epochs">
+<img src="images/siglip_train_scr2.png" width="800" alt="SigLIP Training Loss over Epochs">
 <br><br>
 
 ### Phi-2 VLM Training
 
-<img src="images/phi-vlm-train_scr2-Start1.png" width="600" alt="Phi-2 VLM Training Start">
+<img src="images/phi-vlm-train_scr2-Start1.png" width="800" alt="Phi-2 VLM Training Start">
 <br><br>
-<img src="images/phi-vlm-train_scr2-Start2.png" width="600" alt="Phi-2 VLM Training Start">
+<img src="images/phi-vlm-train_scr2-Start2.png" width="800" alt="Phi-2 VLM Training Start">
 <br><br>
-<img src="images/phi-vlm-train_scr2-Mid1.png" width="600" alt="Phi-2 VLM Training In-Progress">
+<img src="images/phi-vlm-train_scr2-Mid1.png" width="800" alt="Phi-2 VLM Training In-Progress">
 <br><br>
-<img src="images/phi-vlm-train_scr2-Mid2.png" width="600" alt="Phi-2 VLM Training In-Progress">
+<img src="images/phi-vlm-train_scr2-Mid2.png" width="800" alt="Phi-2 VLM Training In-Progress">
 <br><br>
-<img src="images/phi-vlm-train_scr2-Mid3.png" width="600" alt="Phi-2 VLM Training In-Progress">
+<img src="images/phi-vlm-train_scr2-Mid3.png" width="800" alt="Phi-2 VLM Training In-Progress">
 <br><br>
-<img src="images/phi-vlm-train_scr2-Completion.png" width="600" alt="Phi-2 VLM Training Completion">
+<img src="images/phi-vlm-train_scr2-Completion.png" width="800" alt="Phi-2 VLM Training Completion">
 <br><br>
 
 ## Example Usage
 
 Complete training workflow example:
 
+1. CIFAR-10 Dataset analysis using Smolvlm model
 ```
 python smolvlm_cifar_analysis.py
 ```
+2. Siglip training using the csv file created in previous step
 ```
 python train_siglip.py --input-csv output/infer_test_20250405_224942.csv
 ```
+3. VLM training using csv (Step 1) and model (Step 2)
 ```
 python train_phi2_vlm-2.py --input-csv output/infer_test_20250405_224942.csv --siglip-checkpoint models/siglip_phi_cifar10_20250406_215008/final_model.pt --batch-size 4 --num-epochs 1 --gradient-accumulation-steps 16 --learning-rate 1e-4
 ```
