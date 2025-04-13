@@ -175,7 +175,19 @@ class CheckpointManager:
                 "optimizer_state_dict": trainer.optimizer.state_dict() if trainer.optimizer else None,
                 "scheduler_state_dict": trainer.lr_scheduler.state_dict() if trainer.lr_scheduler else None,
                 "scaler_state_dict": trainer.scaler.state_dict() if hasattr(trainer, "scaler") and trainer.scaler else None,
-                "trainer_state": trainer.state.serialize(),
+                "trainer_state": {
+                    "global_step": trainer.state.global_step,
+                    "epoch": trainer.state.epoch,
+                    "max_steps": trainer.state.max_steps,
+                    "num_train_epochs": trainer.state.num_train_epochs,
+                    "total_flos": trainer.state.total_flos,
+                    "log_history": trainer.state.log_history,
+                    "best_metric": trainer.state.best_metric,
+                    "best_model_checkpoint": trainer.state.best_model_checkpoint,
+                    "is_local_process_zero": trainer.state.is_local_process_zero,
+                    "is_world_process_zero": trainer.state.is_world_process_zero,
+                    "is_hyper_param_search": trainer.state.is_hyper_param_search,
+                },
                 "rng_state": {
                     "python": random.getstate(),
                     "numpy": np.random.get_state(),
@@ -303,10 +315,10 @@ class Config:
         
         # Training configuration
         self.max_length = 512
-        self.batch_size = 16  # Reduced from 32 for stability
+        self.batch_size = 4  # Keep small batch size for stability
         self.gradient_accumulation_steps = 8  # Keep as is
-        self.num_epochs = 3
-        self.learning_rate = 1e-4  # Reduced from 4e-4 for stability
+        self.num_epochs = 1
+        self.learning_rate = 1e-5  # Keep very small learning rate
         self.weight_decay = 0.01
         self.warmup_ratio = 0.05  # Increased from 0.03 for better initialization
         self.eval_steps = 100
@@ -315,15 +327,15 @@ class Config:
         
         # Dataset configuration
         self.image_size = 224
-        self.num_workers = 16  # Increased number of workers
+        self.num_workers = 8  # Reduced from 16 for stability
         self.pin_memory = True
-        self.prefetch_factor = 4  # Increased prefetch factor
+        self.prefetch_factor = 2  # Reduced from 4 for stability
         self.persistent_workers = True
-        self.use_length_sampler = False  # Disabled for custom sampler
+        self.use_length_sampler = False
         
         # Optimization configuration
-        self.use_flash_attention = True  # Enable Flash Attention 2
-        self.use_bettertransformer = True
+        self.use_flash_attention = False  # Disabled for stability
+        self.use_bettertransformer = False  # Disabled for stability
         self.torch_compile = False
         self.gradient_checkpointing = True
         
@@ -415,7 +427,8 @@ class VLMTrainer(Trainer):
         self.start_time = time.time()
         self.total_tokens = 0
         self.last_checkpoint_step = 0
-        self.checkpoint_interval = 100  # Save checkpoint every N steps
+        #self.checkpoint_interval = 100  # Save checkpoint every N steps
+        self.checkpoint_interval = 3  # Save checkpoint every N steps
         self.best_loss = float('inf')
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -501,10 +514,10 @@ class VLMTrainer(Trainer):
                     self.args.train_batch_size * self.state.global_step / elapsed_time
                 )
                 
-                # Log to tensorboard
+                # Log to tensorboard with 8 decimal places for learning rate
                 self.log({
                     'train/loss': loss.item(),
-                    'train/learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'train/learning_rate': float(f"{self.optimizer.param_groups[0]['lr']:.8f}"),
                     'train/tokens_per_second': tokens_per_second,
                     'train/samples_per_second': self.train_metrics['samples_per_second'][-1],
                     'train/epoch': self.state.epoch,
@@ -970,16 +983,6 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
             bnb_4bit_quant_storage=torch.float16  # Use float16 for storage
         )
         
-        # Check for Flash Attention availability
-        use_flash_attention = config.use_flash_attention
-        if use_flash_attention:
-            try:
-                import flash_attn
-                logger.info("Flash Attention 2 is available and will be used")
-            except ImportError:
-                logger.warning("Flash Attention 2 is not available. Falling back to standard attention.")
-                use_flash_attention = False
-        
         # Load model with optimizations
         model_kwargs = {
             "quantization_config": bnb_config,
@@ -988,11 +991,6 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
             "torch_dtype": torch.float16,
             "cache_dir": config.cache_dir,
         }
-        
-        if use_flash_attention:
-            # Replace deprecated parameter with the new one
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            model_kwargs["attention_dropout"] = 0.1  # Add dropout for stability
         
         # Load base model first
         logger.info("Loading base model...")
@@ -1013,16 +1011,6 @@ def setup_model_and_tokenizer(config: Config) -> Tuple[AutoModelForCausalLM, Aut
             logger.info("Enabling gradient checkpointing on base model...")
             base_model.gradient_checkpointing_enable()
             base_model.enable_input_require_grads()  # Enable input gradients for checkpointing
-        
-        # Apply BetterTransformer to base model if enabled
-        if config.use_bettertransformer:
-            try:
-                from optimum.bettertransformer import BetterTransformer
-                logger.info("Applying BetterTransformer to base model...")
-                base_model = BetterTransformer.transform(base_model)
-                logger.info("BetterTransformer optimization enabled")
-            except Exception as e:
-                logger.warning(f"Failed to enable BetterTransformer: {str(e)}")
         
         # Now wrap base model with VLMPhi2
         logger.info("Wrapping base model with VLMPhi2...")
