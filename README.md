@@ -169,65 +169,36 @@ Below are screenshots from the training process, showcasing the model's performa
 ### SigLIP Training
 
 <img src="images/siglip_train_scr1.png" width="600" alt="SigLIP Training Loss over Epochs">
-
+<br><br>
 <img src="images/siglip_train_scr2.png" width="600" alt="SigLIP Training Loss over Epochs">
+<br><br>
 
 ### Phi-2 VLM Training
 
-<img src="images/phi-vlm-train_scr1.png" width="600" alt="Phi-2 VLM Training Progress">
+<img src="images/phi-vlm-train_scr2-Start1.png" width="600" alt="Phi-2 VLM Training Start">
+<br><br>
+<img src="images/phi-vlm-train_scr2-Start2.png" width="600" alt="Phi-2 VLM Training Start">
+<br><br>
+<img src="images/phi-vlm-train_scr2-Mid1.png" width="600" alt="Phi-2 VLM Training In-Progress">
+<br><br>
+<img src="images/phi-vlm-train_scr2-Mid2.png" width="600" alt="Phi-2 VLM Training In-Progress">
+<br><br>
+<img src="images/phi-vlm-train_scr2-Mid3.png" width="600" alt="Phi-2 VLM Training In-Progress">
+<br><br>
+<img src="images/phi-vlm-train_scr2-Completion.png" width="600" alt="Phi-2 VLM Training Completion">
+<br><br>
 
 ## Example Usage
 
 Complete training workflow example:
 
-```bash
-# 1. Generate dataset from CIFAR-10 with SmolVLM2
-python smolvlm_cifar_analysis.py --output-dir data
-
-# 2. Train SigLIP model
-python train_siglip.py --input-csv data/infer_test_*.csv --batch-size 32 --num-epochs 10
-
-# 3. Train Phi-2 VLM
-python train_phi2_vlm.py \
-  --input-csv data/infer_test_*.csv \
-  --siglip-checkpoint models/siglip_phi_cifar10_*/final_model.pt \
-  --batch-size 16 \
-  --num-epochs 3
+```
+python smolvlm_cifar_analysis.py
+```
+```
+python train_siglip.py --input-csv output/infer_test_20250405_224942.csv
+```
+```
+python train_phi2_vlm-2.py --input-csv output/infer_test_20250405_224942.csv --siglip-checkpoint models/siglip_phi_cifar10_20250406_215008/final_model.pt --batch-size 4 --num-epochs 1 --gradient-accumulation-steps 16 --learning-rate 1e-4
 ```
 
-## Results Analysis
-
-The training process logs metrics to WandB and TensorBoard, including:
-
-- Loss values
-- Learning rates
-- Training speed (tokens per second)
-- Gradient norms
-- AMP scaling factors
-
-Visualizations are automatically generated to track training progress.
-
-## Performance Considerations
-
-- **GPU Memory**: The default configuration requires approximately 16GB of GPU memory.
-- **Training Time**: Training the SigLIP model takes around 2-3 hours on a modern GPU. The Phi-2 VLM training can take 12-50+ hours depending on hardware and optimization settings.
-- **Optimizations**: Enable Flash Attention 2 and BetterTransformer for the best performance if your hardware supports it.
-- **Batch Size**: Adjust batch size and gradient accumulation based on available memory.
-
-## Future Work
-
-- Implement more efficient backbones for the image encoder
-- Explore alternative LoRA configurations for better parameter efficiency
-- Add support for larger language models
-- Implement RLHF (Reinforcement Learning from Human Feedback) for improved outputs
-- Extend to other image datasets beyond CIFAR-10
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgements
-
-- The project uses Microsoft's Phi-2 model for text generation
-- SigLIP implementation inspired by contrastive vision-language approaches
-- CIFAR-10 dataset from the Canadian Institute For Advanced Research
