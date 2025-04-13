@@ -30,9 +30,9 @@ The framework is highly optimized for performance, incorporating techniques like
 
 The repository contains the following main components:
 
+- **`smolvlm_cifar_analysis.py`**: Analysis script for CIFAR-10 using SmolVLM2 for benchmarking.
 - **`train_siglip.py`**: Trains the SigLIP model on CIFAR-10 to create aligned image embeddings.
 - **`train_phi2_vlm.py`**: Uses the trained SigLIP model to fine-tune the Phi-2 language model.
-- **`smolvlm_cifar_analysis.py`**: Analysis script for CIFAR-10 using SmolVLM2 for benchmarking.
 
 ## Installation
 
@@ -86,7 +86,17 @@ Dataset_Index,A1,A2,A3,A4,A5
 
 ## Training Pipeline
 
-### 1. SigLIP Training
+### 1. Image Analysis
+
+Analyze CIFAR-10 images with SmolVLM2 for benchmarking:
+
+```bash
+python smolvlm_cifar_analysis.py \
+  --output-dir output \
+  --resume path/to/existing/output.csv  # Optional, to resume previous run
+```
+
+### 2. SigLIP Training
 
 Train the SigLIP model to create aligned image embeddings:
 
@@ -100,7 +110,7 @@ python train_siglip.py \
 
 The SigLIP model uses a ResNet50 backbone with a projection layer that maps to a 512-dimensional embedding space. The model is trained with contrastive loss to align image and text representations.
 
-### 2. Phi-2 VLM Training
+### 3. Phi-2 VLM Training
 
 Use the trained SigLIP model to fine-tune Phi-2:
 
@@ -115,15 +125,6 @@ python train_phi2_vlm.py \
 
 This script uses QLoRA to efficiently fine-tune the Phi-2 model while keeping memory requirements manageable. The model learns to generate textual descriptions based on image embeddings from the SigLIP model.
 
-### 3. Image Analysis
-
-Analyze CIFAR-10 images with SmolVLM2 for benchmarking:
-
-```bash
-python smolvlm_cifar_analysis.py \
-  --output-dir output \
-  --resume path/to/existing/output.csv  # Optional, to resume previous run
-```
 
 ## Model Architecture
 
@@ -188,20 +189,5 @@ Below are screenshots from the training process, showcasing the model's performa
 <img src="images/phi-vlm-train_scr2-Completion.png" width="800" alt="Phi-2 VLM Training Completion">
 <br><br>
 
-## Example Usage
 
-Complete training workflow example:
-
-1. CIFAR-10 Dataset analysis using Smolvlm model
-```
-python smolvlm_cifar_analysis.py
-```
-2. Siglip training using the csv file created in previous step
-```
-python train_siglip.py --input-csv output/infer_test_20250405_224942.csv
-```
-3. VLM training using csv (Step 1) and model (Step 2)
-```
-python train_phi2_vlm-2.py --input-csv output/infer_test_20250405_224942.csv --siglip-checkpoint models/siglip_phi_cifar10_20250406_215008/final_model.pt --batch-size 4 --num-epochs 1 --gradient-accumulation-steps 16 --learning-rate 1e-4
-```
 
